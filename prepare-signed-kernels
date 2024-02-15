@@ -1,0 +1,261 @@
+#!/bin/bash
+#
+# Script to manage making sure that all kernels in /boot that fit are bundled up into
+# signed unified kernel images copied into the EFI partition for systemd-boot to use.  
+#
+#
+set -o nounset
+set -o errexit
+
+# Kernel command line, if not set this script will try to grab this from the /etc/default/grub file.
+# If you are doing this for secure boot, you probably want to add panic=0 and module.sig_enforce=1
+CMDLINE=""
+
+# Boot title.  This is the name you want to display in the menu on boot.  So the menu will list
+# entries like "Ubuntu - latest, Ubuntu - 6.6.6 , etc." if you set this to Ubuntu.
+# Set SHORTTITTLE to a short version of the name (no spaces, it will be used to make a file name).
+BOOTTITTLE="My Linux"
+SHORTTITTLE=linux
+
+# Microcode files to be bundled in.  You don't want to load untrusted microcode updates, so if your
+# CPU needs this, add the path to the file here for it to be included in the unified kernel image, so
+# it is signed along with that kernel.
+# TODO: Actually test that this works.  I haven't yet cared enough since I don't need it for my hardware
+MICROCODE=""
+
+# Splash screen image.  If you want a splash screen image included in the unified kernel image, specify
+# the location here.  This seems to only work with bmp.  
+SPLASHIMAGE=""
+
+# EFI location.  Where is your EFI partition mounted?
+EFILOCATION=/boot/efi
+
+# EFI kernel location.  If you want your unified kernel images in /boot/efi/ubuntu, set this to Ubuntu
+EFIKERNELDIR=my_linux
+
+# Name of the certificate to use to sign stuff for secure boot.  If set to "" it will disable signing.
+#  This is for testing only since signing is kinda the whole point of this script.  
+CERT_NAME="my own kernel-signing key"
+#CERT_NAME=""
+
+# Where to find the ukify.py program (you might have to download separately from
+# https://github.com/systemd/systemd/blob/main/src/ukify/ukify.py
+# if you are on an LTS Ubuntu or other distribution with a version of systemd
+# old enough it doesn't include ukify.  
+UKIFY=/root/bin/ukify.py
+
+# What tool to use to sign.
+SIGNTOOL=pesign
+
+#### End of configuration
+
+
+
+#### Some functions here, script starts at MAIN below
+print_normal() {
+    tput sgr0
+}
+
+print_red() {
+    echo -en '\E[31m'
+}
+
+print_green() {
+    echo -en '\E[32m'
+}
+
+echo_message() {
+    print_red
+    echo -n "prepare-signed-kernels "
+    print_normal
+    echo "${1}"
+}
+
+cleanup() {
+    # When the script exists, clean up temp files
+    while read -r filename ; do
+	test -e "$filename" && rm -fr "$filename"
+    done < "${files_to_clean}"
+}
+
+mktemp_dir_with_cleanup() {
+    # Make a temp directory that will automatically be cleaned up by cleanup
+    filename="$(mktemp -d)"
+    echo "$filename" | tee -a "${files_to_clean}"
+}
+
+prepare_kernel_image() {
+    UKIFY_ARGUMENTS=(build)
+
+    # create the unified kernel image
+    KERNEL_FILE="/boot/vmlinuz-${1}"
+    if [[ -f $KERNEL_FILE ]] ; then
+	UKIFY_ARGUMENTS+=(--linux "${KERNEL_FILE}")
+    else
+	echo_message "Failure!  Why can't I find kernel ${KERNEL_FILE}?"
+	exit 1
+    fi
+
+    if [[ $SPLASHIMAGE != "" ]] ; then
+	if [[ -f $SPLASHIMAGE ]] ; then
+	    UKIFY_ARGUMENTS+=(--splash "${SPLASHIMAGE}")
+	else
+	    echo_message "Can't find requested splash ${SPLASHIMAGE}, but continuing without it"
+	fi
+    fi
+
+    # Microcode seems to need to come before initrd because it uses the --initrd option like the initrd does,
+    # so order matters?
+    if [[ $MICROCODE != "" ]] ; then
+	if [[ -f $MICROCODE ]] ; then
+	    UKIFY_ARGUMENTS+=(--initrd "${MICROCODE}")
+	else
+	    echo_message "Can't find requested microcode file ${SPLASHIMAGE}, but continuing without it"
+	fi
+    fi
+
+    INITRD_FILE="/boot/initrd.img-${1}"
+    if [[ -f "${INITRD_FILE}" ]] ; then
+	UKIFY_ARGUMENTS+=(--initrd "${INITRD_FILE}")
+    else
+	echo_message "Failure!  Why can't I find initrd ${KERNEL_FILE}?"
+	exit 1
+    fi
+
+    UKIFY_ARGUMENTS+=(--cmdline "${CMDLINE}")
+    
+    if [[ $CERT_NAME == "" ]] ; then
+	echo_message "Not signing kernel"
+    else
+	UKIFY_ARGUMENTS+=(--signtool "${SIGNTOOL}")
+	UKIFY_ARGUMENTS+=(--secureboot-certificate-name "${CERT_NAME}" --sign-kernel)
+    fi
+
+    UKIFY_ARGUMENTS+=(--output "${temp_dir}/kernel")
+
+    "$UKIFY" "${UKIFY_ARGUMENTS[@]}"
+}
+
+
+#MAIN
+
+# There's nothing to do if ukify doesn't exist
+if [[ ! -f ${UKIFY} ]] ; then
+    echo_message "ukify not found, so not able to do anything."
+    exit 1
+fi
+
+case $SIGNTOOL in
+    */*)
+	#This section if the SIGNTOOL has a / in it, assume it's the full path to the file
+	if [[ ! -f $SIGNTOOL ]] ; then
+	    echo_message "$SIGNTOOL not found, so not able to do anything."
+	    exit 1
+	fi
+	;;
+    *)
+	#If there's no path, we will try using which to look for it
+	result="$(which ${SIGNTOOL})"
+	if [[ $result == "" ]] ; then
+	    echo_message "$SIGNTOOL not found, so not able to do anything."
+	    exit 1
+	fi
+
+	if [[ ! -f $result ]] ; then
+	    echo_message "$SIGNTOOL not found, so not able to do anything."
+	    exit 1
+	fi
+	;;
+esac
+
+
+# Make sure the script will cleanup after itself, even if things go wrong
+files_to_clean=$(mktemp)
+echo "$files_to_clean" > "$files_to_clean"
+trap cleanup EXIT
+
+# If CMDLINE empty, try to get it from the /etc/default/grub file
+if [[ $CMDLINE == "" ]] ; then
+    if [[ -f /etc/default/grub ]] ; then
+	root="$(grep -o 'root=[^ ]*' /proc/cmdline )"
+	CMDLINE="${root} $( grep '^GRUB_CMDLINE_LINUX=' /etc/default/grub | \
+    		tail -n 1 | sed 's/^GRUB_CMDLINE_LINUX="//g' | sed 's/"$//g' )"
+    else
+	# CMDLINE isn't explicitly set, and we couldn't find it in grub config, so lets just copy the
+	# one from the running kernel
+	echo_message "Reusing the kernel command line from the running kernel.  "
+	echo_message "This can be unreliable so you should set it explicitly."
+	CMDLINE="$(cat /proc/cmdline)"0
+    fi
+fi
+
+# Get a list of kernels in /boot
+KERNELS=()
+# Sort -V sorts by version number rules, so 1.30 goes between 1.4 and 1.40.  
+FIND="find /boot -maxdepth 1 -name 'vmlinuz-*' -type f -not -name '*.dpkg-tmp' -print0 | sort -Vrz"
+while IFS= read -r -u3 -d $'\0' LINE; do
+	KERNEL=$(basename "${LINE}")
+	KERNELS+=("${KERNEL:8}")  #Starting from the 9th character, or right after the - in vmlinuz-1.2.3
+done 3< <(eval "${FIND}")
+
+# Make sure there's at least one kernel in the list
+if [ ${#KERNELS[@]} -lt 1 ]; then
+    echo_message "No kernels found!"
+    exit 1
+fi
+
+temp_dir="$(mktemp_dir_with_cleanup)"
+
+# Perform a nuclear clean to ensure everything is always in
+# perfect sync.
+# !! DANGER starts here.  If there's a failure between here and the kernel being installed
+#    the system will be left in an unbootable state.  
+mkdir -p "${EFILOCATION}/loader/entries"
+rm -f "${EFILOCATION}"/loader/entries/*conf || true #it's ok if there were no files to delete
+rm -rf "${EFILOCATION:?}/${EFIKERNELDIR}" || true
+mkdir "${EFILOCATION}/${EFIKERNELDIR}"
+
+# Unify and sign the latest kernel, and copy as the default option.
+# This will use the -latest filename so new kernels replace the previous latest
+LATEST="${KERNELS[@]:0:1}"
+echo_message "Preparing ${LATEST}"
+prepare_kernel_image "${LATEST}"
+mv "${temp_dir}/kernel" "${EFILOCATION:?}/${EFIKERNELDIR}/Linux-latest"
+cat <<EOF > "${EFILOCATION}/loader/entries/latest+3.conf"
+title ${BOOTTITTLE} - Latest
+efi   /${EFIKERNELDIR}/Linux-latest
+
+EOF
+
+# If there are loader entries that have been kept, restore them
+# Good for other OSs, recovery partitions, etc.  
+if [[ -d "${EFILOCATION}/loader/kept_entries" ]] ; then
+    cp "${EFILOCATION}/loader/kept_entries"/* "${EFILOCATION}/loader/entries/"
+fi
+
+# And for the rest of the kernels (if there are more)
+if [[ ${#KERNELS[@]} -gt 1 ]] ; then
+    # Make a list of all but the first kernel
+    remaining=("${KERNELS[@]:1}")
+    for VERSION in "${remaining[@]}" ; do
+	echo_message "Preparing ${VERSION}"
+	prepare_kernel_image "${VERSION}"
+	# check if it will fit
+	kernel_size="$(stat -c %s "${temp_dir}/kernel")"
+	efi_free_space="$(($(stat -f --format="%a*%S" /boot/efi)))"
+	if [[ $kernel_size -lt $efi_free_space ]] ; then
+	    mv "${temp_dir}/kernel" "${EFILOCATION}/${EFIKERNELDIR}/Linux-${VERSION}"
+	    cat <<EOF > "${EFILOCATION}/loader/entries/${SHORTTITTLE}-${VERSION}.conf"
+title ${BOOTTITTLE} - ${VERSION}
+efi   /${EFIKERNELDIR}/Linux-${VERSION}
+	    
+EOF
+	else
+	    echo_message "Not enough space for this one: $VERSION"
+	    rm "${temp_dir:?}/kernel"
+	fi
+    done
+fi
+
+echo_message "Done, yay"
+exit 0
