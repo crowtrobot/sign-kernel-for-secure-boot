@@ -118,8 +118,14 @@ prepare_kernel_image() {
     if [[ -f "${INITRD_FILE}" ]] ; then
 	UKIFY_ARGUMENTS+=(--initrd "${INITRD_FILE}")
     else
-	echo_message "Failure!  Why can't I find initrd ${KERNEL_FILE}?"
-	exit 1
+	echo_message "Failure!  Why can't I find initrd ${INITRD_FILE}?"
+	if [[ $1 == $LATEST ]] ; then
+	    exit 1
+	else
+	    echo_message "Skipping because initrd ${INITRD_FILE} is missing.  "
+	    echo_message "If this happened when apt upgraded kernel it's likely going to fix itself.  "
+	    return 1
+	fi
     fi
 
     UKIFY_ARGUMENTS+=(--cmdline "${CMDLINE}")
@@ -239,7 +245,9 @@ if [[ ${#KERNELS[@]} -gt 1 ]] ; then
     remaining=("${KERNELS[@]:1}")
     for VERSION in "${remaining[@]}" ; do
 	echo_message "Preparing ${VERSION}"
-	prepare_kernel_image "${VERSION}"
+	# If we can't make the image for one, skip it.  Will fail if that's the latest kernel.
+	# This happened with an old kernel when installing updates, but fixed itself later when the initrd got regenerated.  
+	prepare_kernel_image "${VERSION}" || continue #if that returns error, skip the rest of this because the prepared image wasn't made
 	# check if it will fit
 	kernel_size="$(stat -c %s "${temp_dir}/kernel")"
 	efi_free_space="$(($(stat -f --format="%a*%S" /boot/efi)))"
