@@ -47,6 +47,10 @@ UKIFY=/root/bin/ukify.py
 # What tool to use to sign.
 SIGNTOOL=pesign
 
+# Verify systemd bootloader is signed?
+# If systemdboot has been updated it won't be signed anymore.
+CHECK_AND_SIGN_SYSTEMDBOOT=yes
+
 #### End of configuration
 
 
@@ -62,6 +66,18 @@ print_red() {
 
 print_green() {
     echo -en '\E[32m'
+}
+
+echo_green() {
+    print_green
+    echo "$@"
+    print_normal
+}
+
+echo_red() {
+    print_red
+    echo "$@"
+    print_normal
 }
 
 echo_message() {
@@ -82,6 +98,28 @@ mktemp_dir_with_cleanup() {
     # Make a temp directory that will automatically be cleaned up by cleanup
     filename="$(mktemp -d)"
     echo "$filename" | tee -a "${files_to_clean}"
+}
+
+sign_systemdboot() {
+    mv $loader ${loader}.unsigned
+    $SIGNTOOL -s -o $loader -i ${loader}.unsigned -c "$CERT_NAME"
+}
+
+check_systemdboot_signed() {
+    loader=/boot/efi/EFI/systemd/systemd-bootx64.efi
+    results="$($SIGNTOOL -S -i $loader)"
+    if [[ "$results" == "No signatures found." ]] ; then
+	echo_red "The systemdboot loader is not signed, need to try to sign it"
+	sign_systemdboot
+	echo_green "ok, done"
+    else
+	if [[ "$(echo "$results" | grep -o "$CERT_NAME")" == "$CERT_NAME" ]] ; then
+	    echo_green "bootloader signature looks ok"
+	else
+	    echo_red "bootloader signed, but not by my key?  Seems not good"
+	    sign_systemdboot
+	fi
+    fi
 }
 
 prepare_kernel_image() {
@@ -119,7 +157,7 @@ prepare_kernel_image() {
 	UKIFY_ARGUMENTS+=(--initrd "${INITRD_FILE}")
     else
 	echo_message "Failure!  Why can't I find initrd ${INITRD_FILE}?"
-	if [[ $1 == $LATEST ]] ; then
+	if [[ "$1" == "$LATEST" ]] ; then
 	    exit 1
 	else
 	    echo_message "Skipping because initrd ${INITRD_FILE} is missing.  "
@@ -180,6 +218,14 @@ files_to_clean=$(mktemp)
 echo "$files_to_clean" > "$files_to_clean"
 trap cleanup EXIT
 
+# if configured to check systemdboot
+case $CHECK_AND_SIGN_SYSTEMDBOOT in
+    yes|YES|true|TRUE)
+	check_systemdboot_signed
+	;;
+esac
+
+
 # If CMDLINE empty, try to get it from the /etc/default/grub file
 if [[ $CMDLINE == "" ]] ; then
     if [[ -f /etc/default/grub ]] ; then
@@ -223,7 +269,7 @@ mkdir "${EFILOCATION}/${EFIKERNELDIR}"
 
 # Unify and sign the latest kernel, and copy as the default option.
 # This will use the -latest filename so new kernels replace the previous latest
-LATEST="${KERNELS[@]:0:1}"
+LATEST="${KERNELS[*]:0:1}"
 echo_message "Preparing ${LATEST}"
 prepare_kernel_image "${LATEST}"
 mv "${temp_dir}/kernel" "${EFILOCATION:?}/${EFIKERNELDIR}/Linux-latest"
