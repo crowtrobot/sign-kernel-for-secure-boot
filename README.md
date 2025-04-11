@@ -1,4 +1,7 @@
 # sign-kernel-for-secure-boot
+
+## **Depricated** - With newer systemd installation in newer distributions, we don't need to make our own anymore.  Systemd-ukify and kernel-install replaces this entirely and does a better job.  
+
 Script to make unified kernel images, and sign them for secure boot.  
 
 Have you ever wanted to use Secure Boot but have it actually be secure?  By default "Secure Boot" will boot anything Microsoft has decided your computer should be willing to boot.  That's fine if you trust Microsoft to always do that right, but since they signed Windows, I don't know if I can trust what they consider "secure".  ☺
